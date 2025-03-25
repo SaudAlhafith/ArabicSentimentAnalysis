@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import torch.optim.adam
-import pandas as pd
 from minbpe import RegexTokenizer
 
 batch_size = 64
