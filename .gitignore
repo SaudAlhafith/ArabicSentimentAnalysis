@@ -1,0 +1,14 @@
+*.txt
+*.pkl
+*.pth
+*.json
+ipynb_checkpoints/
+*.pt
+neg/
+pos/
+*.csv
+__pycache__/
+*.pyc
+*.egg-info/
+*.zip
+*.tsv
