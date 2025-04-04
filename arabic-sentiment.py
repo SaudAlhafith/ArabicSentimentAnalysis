@@ -5,16 +5,16 @@ from torch.nn import functional as F
 import torch.optim.adam
 from minbpe import RegexTokenizer
 
-batch_size = 64
+batch_size = 32
 block_size = 256
-max_iters = 10000
+max_iters = 2000
 eval_interval = 500
 eval_iters = 100
 learning_rate = 3e-4
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 n_embd = 384
-n_head = 8
-n_layer = 8
+n_head = 6
+n_layer = 6
 dropout = 0.1
 
 torch.manual_seed(1337)
@@ -87,19 +87,18 @@ class Head(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x):
+    def forward(self, x, mask=None):
         B, T, C = x.shape
         k = self.key(x) # B, T, H
         q = self.query(x) # B, T, H
-
-        wei = q @ k.transpose(-2, -1) * C**-0.5 # B, T, T
-        attentionMask = (wei != 0).int()
-        wei = wei.masked_fill(attentionMask == 0, float('-inf')) # B, T, T
-        wei = F.softmax(wei, dim=-1)
-        wei = self.dropout(wei)
-
         v = self.value(x) # B, T, H
-        out = wei @ v # B, T, H
+
+        # wei = q @ k.transpose(-2, -1) * C**-0.5 # B, T, T
+        # if mask is not None:
+        #     wei = wei.masked_fill(mask.unsqueeze(1).expand(B, T, T) == 0, float('-inf')) # B, T, T
+        # wei = F.softmax(wei, dim=-1)
+        # wei = self.dropout(wei)
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask = mask.unsqueeze(1).expand(B, T, T), dropout_p=dropout) # B, T, H
         return out
     
 class MultiHeadAttention(nn.Module):
@@ -110,8 +109,8 @@ class MultiHeadAttention(nn.Module):
         self.proj = nn.Linear(n_embd, n_embd)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x):
-        out = torch.cat([h(x) for h in self.heads], dim=-1)
+    def forward(self, x, mask=None):
+        out = torch.cat([h(x, mask=mask) for h in self.heads], dim=-1)
         out = self.proj(out)
         out = self.dropout(out)
         return out
@@ -140,9 +139,9 @@ class Block(nn.Module):
         self.ln1 = nn.LayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
     
-    def forward(self, x):
+    def forward(self, x, mask=None):
         x = self.ln1(x)
-        x = x + self.sa(x)
+        x = x + self.sa(x, mask=mask)
         x = self.ln2(x)
         x = x + self.ffwd(x)
         return x
@@ -154,17 +153,19 @@ class SentimentTransformerModel(nn.Module):
 
         self.token_embbeding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
-        self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
+        self.blocks = nn.ModuleList([Block(n_embd, n_head=n_head) for _ in range(n_layer)])
         self.ln_f = nn.LayerNorm(n_embd)
         self.lm_head = nn.Linear(n_embd, num_classes) 
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
 
+        mask = idx[:, -block_size:] != 0
         tok_emb = self.token_embbeding_table(idx[:, -block_size:])
         pos_emb = self.position_embedding_table(torch.arange(block_size, device=device))
         x = tok_emb + pos_emb
-        x = self.blocks(x)
+        for block in self.blocks:
+            x = block(x, mask=mask)
         x = self.ln_f(x)
         # Last token
         logits = self.lm_head(x[:, -1, :])
@@ -191,6 +192,8 @@ m = model.to(device)
 num_parameters = sum(p.nelement() for p in model.parameters())
 print(f"Parameters: {num_parameters}")
 
+torch.set_float32_matmul_precision('high')
+
 def train():
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
@@ -202,9 +205,9 @@ def train():
             if iter % eval_interval == 0 or iter == max_iters - 1:
                 losses = estimate_loss(pbar)
                 tqdm.write(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-                model_save_path = "sentiment_analysis_v1"
-                torch.save(model.state_dict(), f"{model_save_path}-{iter}-cs{block_size}-nl{n_layer}.pth")
-                print(f"Model {model_save_path} Saved Successfully")
+                # model_save_path = "sentiment_analysis_v1"
+                # torch.save(model.state_dict(), f"{model_save_path}-{iter}-cs{block_size}-nl{n_layer}.pth")
+                # print(f"Model {model_save_path} Saved Successfully")
 
 
             X, Y = get_batch("train")
@@ -212,6 +215,7 @@ def train():
             logits, loss = model(X, Y)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
+            norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             
             # Calculate accuracy
@@ -220,7 +224,7 @@ def train():
             accuracy = correct / batch_size
             running_accuracy = (0.99 * running_accuracy) + (accuracy * 0.01) if iter > 0 else accuracy
             running_loss = (0.99 * running_loss) + (loss * 0.01) if iter > 0 else loss
-            pbar.set_description(f"Loss: {running_loss:.4f} | Acc: {running_accuracy:.4f}")
+            pbar.set_description(f"Loss: {running_loss:.4f} | Acc: {running_accuracy:.4f} | Norm: {norm:.4f}")
             pbar.update(1)
 
     model_save_path = "sentiment_analysis_v1"
@@ -230,7 +234,7 @@ def train():
 train()
 
 def test():
-    model.load_state_dict(torch.load("sentiment_analysis_v1-fixedDB-2000.pth", weights_only=True))
+    model.load_state_dict(torch.load("sentiment_analysis_v1-cs256-nl6.pth", weights_only=True))
     model.eval()  # Set model to evaluation mode
     
     print("\nSentiment Analysis Ready! Enter a sentence (E to exit):\n")
@@ -253,3 +257,5 @@ def test():
         print("Sentiment:", "😊 Positive" if sentiment == 1 else "☹️ Negative")
 
 # test()
+# The issue we have is 0 token's embeddings is getting involved in the shit
+# we need to cut them out, the way we are doing the cut in line # 97 is not correct, there is nothing getting cut
